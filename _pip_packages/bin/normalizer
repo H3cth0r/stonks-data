@@ -1,0 +1,8 @@
+#!/nix/store/a4vwr7xi3qnz372dnyj2jmmr9p1swhhw-python3-3.11.11-env/bin/python3.11
+# -*- coding: utf-8 -*-
+import re
+import sys
+from charset_normalizer import cli
+if __name__ == '__main__':
+    sys.argv[0] = re.sub(r'(-script\.pyw|\.exe)?$', '', sys.argv[0])
+    sys.exit(cli.cli_detect())
