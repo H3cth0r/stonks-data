@@ -48,51 +48,38 @@ def get_latest_timestamp_from_dir(ticker_dir):
     
     last_file = csv_files[-1]
     try:
+        # Read the index column as is first, then parse
         df_last_file = pd.read_csv(last_file, index_col=0) 
         
         if df_last_file.empty:
-            # print(f"Info: File {last_file} is empty.") # Less verbose
             return None
 
-        # Define the expected format based on how pandas writes tz-aware DatetimeIndex
-        # e.g., "2025-05-14 17:34:00+00:00"
         known_csv_datetime_format = '%Y-%m-%d %H:%M:%S%z'
-        
         parsed_index = None
         try:
-            # Try parsing with the known, efficient format first
-            # The index read from CSV is typically a string Series/Index
             parsed_index = pd.to_datetime(df_last_file.index, format=known_csv_datetime_format, utc=True)
         except (ValueError, TypeError):
-            # If the specific format fails (e.g., old file, different format, non-string index values),
-            # fall back to inferring the format (this is where the UserWarning might appear if it still struggles)
-            # print(f"  Debug: Could not parse index of {last_file} with format '{known_csv_datetime_format}'. Falling back to inference.")
             parsed_index = pd.to_datetime(df_last_file.index, errors='coerce', utc=True)
 
         valid_timestamps = parsed_index.dropna()
 
         if valid_timestamps.empty:
-            # print(f"Warning: No valid timestamps found in index of {last_file} after parsing.") # Less verbose
             return None
         
         file_latest_ts_utc = valid_timestamps.sort_values()[-1]
 
-        # Ensure it's a pd.Timestamp (should be if pd.to_datetime worked)
         if not isinstance(file_latest_ts_utc, pd.Timestamp):
             print(f"Internal Error: Last timestamp from {last_file} is not pd.Timestamp. Type: {type(file_latest_ts_utc)}")
             return None
         
-        # Ensure it's UTC (pd.to_datetime with utc=True should handle this)
         if file_latest_ts_utc.tzinfo is None or file_latest_ts_utc.tzinfo.utcoffset(file_latest_ts_utc) != datetime.timedelta(0):
-            # print(f"  Debug: Timestamp {file_latest_ts_utc} from CSV not UTC. Converting.") # Less verbose
             file_latest_ts_utc = file_latest_ts_utc.tz_localize('UTC', ambiguous='infer') if file_latest_ts_utc.tzinfo is None else file_latest_ts_utc.tz_convert('UTC')
 
         if latest_overall_timestamp_utc is None or file_latest_ts_utc > latest_overall_timestamp_utc:
             latest_overall_timestamp_utc = file_latest_ts_utc
             
     except pd.errors.EmptyDataError:
-        # print(f"Info: File {last_file} is empty (Pandas EmptyDataError).") # Less verbose
-        pass # Silently skip empty files
+        pass 
     except FileNotFoundError:
         print(f"Warning: File {last_file} disappeared unexpectedly.")
         return None
@@ -153,6 +140,7 @@ def download_and_store_data(stock_type, ticker):
         print(f"  No new data found for {ticker} in the requested period.")
         return
 
+    # Ensure downloaded data index is UTC
     if data.index.tz is None:
         data.index = data.index.tz_localize('UTC', ambiguous='infer')
     else:
@@ -160,6 +148,7 @@ def download_and_store_data(stock_type, ticker):
     
     data = data.sort_index()
 
+    # Filter out any data that might be before or exactly at our latest_timestamp_from_csv
     if latest_timestamp_from_csv:
         data = data[data.index > latest_timestamp_from_csv]
 
@@ -169,6 +158,7 @@ def download_and_store_data(stock_type, ticker):
 
     print(f"  Downloaded {len(data)} new rows for {ticker}.")
 
+    # --- Storing data ---
     csv_files = sorted(glob.glob(os.path.join(ticker_dir, "*.csv")))
     target_csv_file = None
 
@@ -178,55 +168,55 @@ def download_and_store_data(stock_type, ticker):
             if os.path.getsize(target_csv_file) >= MAX_FILE_SIZE_BYTES:
                 print(f"  File {target_csv_file} is full. Creating a new one.")
                 target_csv_file = get_next_available_filename(ticker_dir)
-        except FileNotFoundError:
+        except FileNotFoundError: # Should not happen if glob found it but good practice
              target_csv_file = get_next_available_filename(ticker_dir)
-    else:
+    else: # No CSV files exist yet
         target_csv_file = get_next_available_filename(ticker_dir)
 
     rows_to_write = data.copy()
     
     while not rows_to_write.empty:
-        current_file_size = 0
+        current_file_size = 0 # Initialize for current target_csv_file
         if os.path.exists(target_csv_file):
-            current__size = os.path.getsize(target_csv_file)
+            # --- !!! THIS IS THE FIX !!! ---
+            current_file_size = os.path.getsize(target_csv_file)
+            # --- !!! END OF FIX !!! ---
 
+        # Determine if header needs to be written for the current target_csv_file
         write_header = not os.path.exists(target_csv_file) or current_file_size == 0
         
-        # Simplified size estimation for appending
-        # A very rough estimate, actual CSV size depends on number of columns, data types, etc.
-        # For more precision, would convert a small chunk to CSV string and extrapolate.
         estimated_bytes_per_row = 150 # A rough guess for OHLCV + timestamp
         estimated_new_data_size = len(rows_to_write) * estimated_bytes_per_row
 
+        # Check if current target_csv_file needs to be rolled over
         if current_file_size > 0 and (current_file_size + estimated_new_data_size > MAX_FILE_SIZE_BYTES) :
             print(f"  File {target_csv_file} ({current_file_size / (1024*1024):.2f}MB) + new data estimate ({estimated_new_data_size / (1024*1024):.2f}MB) would exceed limit. Creating new file.")
             target_csv_file = get_next_available_filename(ticker_dir)
-            write_header = True 
-            current_file_size = 0 
+            write_header = True  # New file always needs a header
+            current_file_size = 0 # Reset for the new file
 
-        # If rows_to_write itself is too big for a single new file (even after the check above)
-        # This part of the logic aims to split the `rows_to_write` DataFrame if it's massive.
+        # Check if the data to write itself is too large for one file segment
+        # (even if target_csv_file is currently empty or new)
         if len(rows_to_write.index) > 1 and estimated_new_data_size > MAX_FILE_SIZE_BYTES and current_file_size == 0:
-            # rows_to_write is too big for an empty file. Split rows_to_write.
-            # Estimate how many rows fit based on our rough estimate
-            num_rows_for_chunk = max(1, int(MAX_FILE_SIZE_BYTES / estimated_bytes_per_row * 0.90)) # 0.90 safety margin
+            num_rows_for_chunk = max(1, int(MAX_FILE_SIZE_BYTES / estimated_bytes_per_row * 0.90)) 
 
             current_chunk = rows_to_write.iloc[:num_rows_for_chunk]
             remaining_rows = rows_to_write.iloc[num_rows_for_chunk:]
             
-            print(f"  Large new data batch. Writing {len(current_chunk)} rows to {target_csv_file}.")
-            current_chunk.to_csv(target_csv_file, mode='a', header=write_header, index=True)
-            rows_to_write = remaining_rows
+            print(f"  Large new data batch. Writing {len(current_chunk)} rows to {target_csv_file} (Header: {write_header}).")
+            current_chunk.to_csv(target_csv_file, mode='a', header=write_header, index=True, date_format='%Y-%m-%d %H:%M:%S%z')
             
-            if not rows_to_write.empty:
-                target_csv_file = get_next_available_filename(ticker_dir) # Next chunk to a new file
-                # current_file_size is 0 for new file, write_header will be true
+            rows_to_write = remaining_rows # Update for next iteration
+            
+            if not rows_to_write.empty: # If there are more rows, they go to a new file
+                target_csv_file = get_next_available_filename(ticker_dir)
+                # For the next iteration of this while loop, current_file_size will be 0 for this new target,
+                # and write_header will correctly be True.
         else:
-            # Write all (remaining) rows
+            # Write all (remaining) rows to the current target_csv_file
             print(f"  Writing {len(rows_to_write)} rows to {target_csv_file} (Header: {write_header}).")
-            # Ensure the index is written in a consistent, parsable format
             rows_to_write.to_csv(target_csv_file, mode='a', header=write_header, index=True, date_format='%Y-%m-%d %H:%M:%S%z')
-            rows_to_write = pd.DataFrame()
+            rows_to_write = pd.DataFrame() # Mark all data as written
 
     print(f"  Successfully updated {ticker}.")
 
